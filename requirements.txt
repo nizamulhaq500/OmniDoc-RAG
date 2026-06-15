@@ -1,0 +1,20 @@
+# Deep Learning Core
+torch>=2.2.0
+torchvision>=0.17.0
+einops>=0.7.0
+
+# Hugging Face Ecosystem
+transformers>=4.40.0
+accelerate>=0.29.0
+peft>=0.10.0
+datasets>=2.18.0
+
+# Document & Image Processing
+pymupdf>=1.24.0
+pillow>=10.2.0
+
+# Experiment Tracking & Utilities
+wandb>=0.16.0
+matplotlib>=3.8.0
+tqdm>=4.66.0
+pytest>=8.0.0

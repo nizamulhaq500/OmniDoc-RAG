@@ -1,0 +1,28 @@
+# Python Virtual Environments & Packages
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Testing & Caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS & Editor files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Logs & Large datasets
+*.log
+data/raw/
+data/cache/
+checkpoints/
+wandb/
