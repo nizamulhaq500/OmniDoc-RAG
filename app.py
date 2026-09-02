@@ -123,6 +123,21 @@ def load_resources():
     return tokenizer, text_model, encoder, processor, device, has_ckpt, ckpt_info
 
 
+import re
+
+STOPWORDS = {
+    "what", "is", "a", "an", "the", "in", "on", "of", "for", "to", "from", 
+    "with", "by", "at", "this", "that", "these", "those", "are", "was", "were", 
+    "be", "been", "being", "have", "has", "had", "do", "does", "did", "can", 
+    "could", "should", "would", "will", "and", "or", "not", "which", "where", 
+    "who", "whom", "how", "why", "tell", "me", "about", "explain", "give", "define"
+}
+
+def extract_keywords(text):
+    """Extract clean keywords without punctuation or stopwords."""
+    cleaned = re.sub(r'[^\w\s]', ' ', text).lower()
+    return [w for w in cleaned.split() if len(w) > 2 and w not in STOPWORDS]
+
 def extract_page_texts(pdf_path):
     """Extract text from each page of the PDF."""
     doc = pymupdf.open(pdf_path)
@@ -135,69 +150,133 @@ def extract_page_texts(pdf_path):
 
 
 def compute_semantic_retrieval(query, pages_text, tokenizer, text_model, device):
-    """Compute dense contextual semantic similarity scores across pages."""
-    # Encode query
+    """
+    Compute multi-scale semantic and lexical similarity scores across document pages.
+    Uses heading matching, exact query n-gram matching, and paragraph semantic max-pooling.
+    """
+    clean_q = re.sub(r'[^\w\s]', ' ', query).lower()
+    keywords = [w for w in clean_q.split() if len(w) > 2 and w not in STOPWORDS]
+    
+    # 1. Dense query embedding
     q_inputs = tokenizer(query, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
     with torch.no_grad():
         q_out = text_model(**q_inputs)
-        # Mean pooling
-        q_emb = q_out.last_hidden_state.mean(dim=1)
-        q_emb = torch.nn.functional.normalize(q_emb, p=2, dim=-1)
+        q_emb = torch.nn.functional.normalize(q_out.last_hidden_state.mean(dim=1), p=2, dim=-1)
     
-    # Encode each page
+    query_stripped = query.lower().strip("?!. ").strip()
     scores = []
-    # Extract query keywords for hybrid lexical-semantic matching
-    keywords = [w.lower() for w in query.split() if len(w) > 3 and w.lower() not in {"what", "where", "which", "that", "this", "from", "have", "with", "there"}]
     
     for idx, text in enumerate(pages_text):
         if not text:
             scores.append((idx, 0.0, ""))
             continue
             
-        p_inputs = tokenizer(text[:1500], return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
-        with torch.no_grad():
-            p_out = text_model(**p_inputs)
-            p_emb = p_out.last_hidden_state.mean(dim=1)
-            p_emb = torch.nn.functional.normalize(p_emb, p=2, dim=-1)
-            
-        sim = torch.cosine_similarity(q_emb, p_emb).item()
-        
-        # Keyword lexical boost
         text_lower = text.lower()
-        keyword_hits = sum(1 for kw in keywords if kw in text_lower)
-        lexical_score = keyword_hits / max(1, len(keywords))
+        score = 0.0
         
-        # Combined hybrid score
-        combined_score = 0.65 * sim + 0.35 * lexical_score
-        scores.append((idx, combined_score, text))
+        # A. Exact phrase / title match
+        if query_stripped in text_lower:
+            score += 15.0
+            
+        # B. Heading / Section Title match (first 150 chars)
+        header = text_lower[:150]
+        for kw in keywords:
+            if re.search(r'\b' + re.escape(kw) + r'\b', header):
+                score += 5.0
+                
+        # C. Keyword matches with word boundaries
+        if keywords:
+            kw_hits = sum(len(re.findall(r'\b' + re.escape(kw) + r'\b', text_lower)) for kw in keywords)
+            score += min(15.0, kw_hits * 1.5)
+            
+            # Co-occurrence bonus if all keywords appear on the page
+            all_present = all(re.search(r'\b' + re.escape(kw) + r'\b', text_lower) for kw in keywords)
+            if all_present and len(keywords) > 1:
+                score += 8.0
+                
+        # D. Semantic similarity via BERT paragraph max-pooling
+        paragraphs = [p.strip() for p in text.split("\n\n") if len(p.strip()) > 30]
+        if not paragraphs:
+            paragraphs = [text[:1200]]
+            
+        p_embeddings = []
+        with torch.no_grad():
+            for p in paragraphs[:8]:
+                p_in = tokenizer(p, return_tensors="pt", padding=True, truncation=True, max_length=256).to(device)
+                p_out = text_model(**p_in)
+                p_emb = torch.nn.functional.normalize(p_out.last_hidden_state.mean(dim=1), p=2, dim=-1)
+                p_embeddings.append(p_emb)
+                
+        if p_embeddings:
+            p_mat = torch.cat(p_embeddings, dim=0)
+            sim_max = torch.max(torch.cosine_similarity(q_emb, p_mat)).item()
+            score += sim_max * 10.0
+            
+        scores.append((idx, score, text))
         
     scores.sort(key=lambda x: x[1], reverse=True)
     return scores
 
 
-def answer_from_page(query, page_text):
-    """Extract relevant answers and evidence sentences directly from page text."""
-    if not page_text:
-        return "No text could be extracted from this page.", []
+def answer_from_page(query, page_text, tokenizer=None, text_model=None, device="cpu"):
+    """
+    Extract grounded answer passages from page text using semantic sentence & section ranking.
+    """
+    if not page_text or not page_text.strip():
+        return "No readable text found on this document page.", []
         
-    sentences = [s.strip() for s in page_text.replace("\n", " ").split(".") if len(s.strip()) > 15]
-    query_words = set(w.lower() for w in query.split() if len(w) > 3)
+    clean_q = re.sub(r'[^\w\s]', ' ', query).lower()
+    keywords = [w for w in clean_q.split() if len(w) > 2 and w not in STOPWORDS]
     
+    # 1. Paragraph / Section matching
+    paragraphs = [p.strip().replace("\n", " ") for p in page_text.split("\n\n") if len(p.strip()) > 25]
+    if not paragraphs:
+        paragraphs = [s.strip() for s in page_text.split("\n") if len(s.strip()) > 25]
+        
+    # Check if a paragraph directly starts with or contains the topic
+    query_stripped = query.lower().strip("?!. ").strip()
+    for p in paragraphs:
+        if query_stripped in p.lower() or any(p.lower().startswith(kw) for kw in keywords):
+            return p, [p]
+            
+    # 2. Sentence-level neural scoring
+    raw_sentences = re.split(r'(?<=[.!?])\s+', page_text.replace("\n", " "))
+    sentences = [s.strip() for s in raw_sentences if len(s.strip()) > 20]
+    if not sentences:
+        return page_text[:400], [page_text[:400]]
+        
     scored_sentences = []
-    for s in sentences:
-        s_words = set(w.lower() for w in s.split())
-        overlap = len(query_words.intersection(s_words))
-        scored_sentences.append((s, overlap))
-        
-    scored_sentences.sort(key=lambda x: x[1], reverse=True)
-    top_matches = [s for s, count in scored_sentences if count > 0][:3]
-    
-    if top_matches:
-        answer = " ".join(top_matches)
-        return answer, top_matches
+    if tokenizer and text_model:
+        q_in = tokenizer(query, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
+        with torch.no_grad():
+            q_emb = torch.nn.functional.normalize(text_model(**q_in).last_hidden_state.mean(dim=1), p=2, dim=-1)
+            
+        for s_idx, s in enumerate(sentences):
+            s_lower = s.lower()
+            kw_hits = sum(1 for kw in keywords if re.search(r'\b' + re.escape(kw) + r'\b', s_lower)) if keywords else 0
+            
+            s_in = tokenizer(s, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
+            with torch.no_grad():
+                s_emb = torch.nn.functional.normalize(text_model(**s_in).last_hidden_state.mean(dim=1), p=2, dim=-1)
+            sim = torch.cosine_similarity(q_emb, s_emb).item()
+            
+            total_s_score = 0.5 * sim + 0.5 * (kw_hits / max(1, len(keywords)))
+            if any(s_lower.startswith(kw) for kw in keywords):
+                total_s_score += 0.3
+            scored_sentences.append((s_idx, s, total_s_score))
     else:
-        # Fallback to top paragraph
-        return sentences[0] if sentences else page_text[:300], sentences[:2]
+        for s_idx, s in enumerate(sentences):
+            s_lower = s.lower()
+            kw_hits = sum(1 for kw in keywords if re.search(r'\b' + re.escape(kw) + r'\b', s_lower)) if keywords else 0
+            scored_sentences.append((s_idx, s, float(kw_hits)))
+            
+    scored_sentences.sort(key=lambda x: x[2], reverse=True)
+    top_candidates = scored_sentences[:3]
+    top_candidates.sort(key=lambda x: x[0])
+    
+    evidence_list = [c[1] for c in top_candidates]
+    answer = " ".join(evidence_list)
+    return answer, evidence_list
 
 
 # --- SIDEBAR ---
@@ -257,22 +336,30 @@ if st.button("🚀 Search & Answer Question", type="primary", use_container_widt
                 top_page_idx, top_score, top_text = scores[0]
             else:
                 # Experimental OmniDoc Dual-Encoder
+                mean_t = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+                std_t = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+                
                 raw_pages = [processor.render_pdf_page(pdf_path, page_idx=p) for p in range(num_pages)]
                 padded_pages = [processor.preprocess_image(p)[0] for p in raw_pages]
                 page_tensors = [processor.image_to_tensor(p).unsqueeze(0).to(device) for p in padded_pages]
-                all_images = torch.cat(page_tensors, dim=0)
+                all_images = (torch.cat(page_tensors, dim=0) - mean_t) / std_t
                 
                 with torch.no_grad():
                     doc_latents = encoder.encode_document(all_images)
                     tok_inputs = tokenizer(query_text, return_tensors="pt", padding=True, truncation=True, max_length=64).to(device)
-                    query_emb = encoder.encode_query(tok_inputs["input_ids"])
+                    q_mask = tok_inputs.get("attention_mask", torch.ones_like(tok_inputs["input_ids"]))
+                    
+                    if isinstance(encoder, ScaledOmniDocDualEncoder):
+                        query_emb = encoder.encode_query(tok_inputs["input_ids"], q_mask)
+                    else:
+                        query_emb = encoder.encode_query(tok_inputs["input_ids"])
                     
                     scores_list = []
                     for p_idx in range(num_pages):
                         d_p = doc_latents[p_idx:p_idx+1]
                         sim_matrix = torch.matmul(query_emb, d_p.transpose(1, 2))
-                        max_sim = torch.max(sim_matrix, dim=-1).values
-                        sc = torch.sum(max_sim).item()
+                        max_sim = torch.max(sim_matrix, dim=-1).values * q_mask.float()
+                        sc = torch.sum(max_sim).item() / max(1.0, q_mask.sum().item())
                         scores_list.append((p_idx, sc, pages_text[p_idx]))
                         
                     scores_list.sort(key=lambda x: x[1], reverse=True)
@@ -281,7 +368,7 @@ if st.button("🚀 Search & Answer Question", type="primary", use_container_widt
 
             # Render winning page image
             winning_img = processor.render_pdf_page(pdf_path, page_idx=top_page_idx, dpi=150)
-            answer_text, evidence_list = answer_from_page(query_text, top_text)
+            answer_text, evidence_list = answer_from_page(query_text, top_text, tokenizer=tokenizer, text_model=text_model, device=device)
 
         st.success(f"✓ Retrieved winning page in {num_pages * 4.2:.1f}ms across {num_pages} pages!")
         st.markdown("---")
